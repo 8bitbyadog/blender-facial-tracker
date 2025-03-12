@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > FaceBuilder",
-    "description": "Generate 3D face models from images using OpenCV and DLib",
+    "description": "Generate 3D face models from images using OpenCV",
     "category": "Object",
 }
 
@@ -28,16 +28,6 @@ def check_dependencies():
         import numpy
     except ImportError:
         missing_packages.append("numpy")
-    
-    try:
-        import dlib
-    except ImportError:
-        missing_packages.append("dlib")
-    
-    try:
-        import scipy
-    except ImportError:
-        missing_packages.append("scipy")
     
     return missing_packages
 
@@ -100,7 +90,15 @@ class FACEBUILDER_OT_LoadImage(Operator):
         # Store the first detected face coordinates
         context.scene.facebuilder_face_coords = faces[0]
         
-        self.report({'INFO'}, f"Detected {len(faces)} faces")
+        # Draw rectangle around face for visualization
+        x, y, w, h = faces[0]
+        cv2.rectangle(image, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        
+        # Save the annotated image
+        output_path = os.path.splitext(self.filepath)[0] + "_detected.jpg"
+        cv2.imwrite(output_path, image)
+        
+        self.report({'INFO'}, f"Detected {len(faces)} faces. Saved annotated image to: {output_path}")
         return {'FINISHED'}
     
     def invoke(self, context, event):
