@@ -32,4 +32,5 @@ jobs:
     
     - name: Run basic tests
       run: |
-        python -c "import cv2; import numpy; import dlib; import scipy" 
+        python -c "import cv2; import numpy"
+        python -m py_compile src/face_tracker.py 

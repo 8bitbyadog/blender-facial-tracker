@@ -22,6 +22,7 @@ import bmesh
 import os
 import sys
 import time
+import logging
 import numpy as np
 from pathlib import Path
 from threading import Thread
@@ -31,17 +32,21 @@ from gpu_extras.batch import batch_for_shader
 import cv2
 import traceback
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[Face Tracker] %(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Add Blender's modules directory to Python path
 blender_scripts_path = Path(bpy.utils.user_resource('SCRIPTS'))
 modules_path = str(blender_scripts_path / "modules")
 if modules_path not in sys.path:
     sys.path.append(modules_path)
 
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
+# OpenCV is already imported above
+OPENCV_AVAILABLE = True
 
 from bpy.props import StringProperty, BoolProperty, FloatProperty, EnumProperty, IntProperty
 from bpy.types import Operator, Panel, PropertyGroup
@@ -307,17 +312,10 @@ class FACETRACKER_OT_StartCamera(Operator):
     bl_idname = "facetracker.start_camera"
     bl_label = "Start Camera"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    _timer = None
-    _cap = None
-    _frame_queue = Queue(maxsize=1)
-    _tracking_thread = None
-    _stop_thread = False
-    _image = None
-    _handle = None
-    _texture = None
-    _batch = None
-    _shader = None
+
+    # Instance variables will be initialized in execute()
+    # Haar Cascade classifier (loaded once for performance)
+    _face_cascade = None
     
     def init_camera(self, camera_idx):
         """Initialize camera with proper settings"""
@@ -405,47 +403,115 @@ class FACETRACKER_OT_StartCamera(Operator):
             try:
                 if not self._frame_queue.empty():
                     frame = self._frame_queue.get()
-                    
+
                     # Convert frame to grayscale for face detection
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    
-                    # Load the face cascade classifier
-                    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-                    face_cascade = cv2.CascadeClassifier(cascade_path)
-                    
-                    # Detect faces
-                    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                    
-                    for (x, y, w, h) in faces:
-                        print(f"Face detected at: {x}, {y}, {w}, {h}")
-                        # Store face coordinates for mesh updates
-                        context.scene.facetracker_face_coords = (x, y, w, h)
-                
+
+                    # Use the pre-loaded face cascade classifier (performance fix)
+                    if self._face_cascade is not None:
+                        # Detect faces
+                        faces = self._face_cascade.detectMultiScale(gray, 1.3, 5)
+
+                        for (x, y, w, h) in faces:
+                            print(f"Face detected at: {x}, {y}, {w}, {h}")
+                            # Store face coordinates for mesh updates
+                            context.scene.facetracker_face_coords = (x, y, w, h)
+
                 # Request redraw for camera feed
                 context.area.tag_redraw()
             except Exception as e:
                 print(f"Error in modal: {str(e)}")
             return {'PASS_THROUGH'}
-        
+
         if event.type == 'ESC' or not context.scene.facetracker.camera_active:
             self.cancel(context)
             return {'CANCELLED'}
-        
+
         return {'PASS_THROUGH'}
+
+    def cancel(self, context):
+        """Properly clean up all resources when stopping"""
+        logger.info("Cleaning up camera resources...")
+
+        # Stop the capture thread
+        if hasattr(self, '_stop_thread'):
+            self._stop_thread = True
+
+        # Wait for thread to finish
+        if hasattr(self, '_tracking_thread') and self._tracking_thread is not None:
+            if self._tracking_thread.is_alive():
+                self._tracking_thread.join(timeout=2.0)
+                logger.info("Capture thread stopped")
+
+        # Release camera
+        if hasattr(self, '_cap') and self._cap is not None:
+            self._cap.release()
+            self._cap = None
+            logger.info("Camera released")
+
+        # Remove timer
+        if hasattr(self, '_timer') and self._timer is not None:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except Exception as e:
+                logger.warning(f"Failed to remove timer: {e}")
+            self._timer = None
+
+        # Remove draw handler
+        if hasattr(self, '_handle') and self._handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            except Exception as e:
+                logger.warning(f"Failed to remove draw handler: {e}")
+            self._handle = None
+
+        # Clean up GPU resources
+        self._texture = None
+        self._batch = None
+        self._shader = None
+
+        # Mark camera as inactive
+        context.scene.facetracker.camera_active = False
+
+        logger.info("Camera resources cleaned up successfully")
     
     def execute(self, context):
-        print("Starting camera...")
+        logger.info("Starting camera...")
         if not OPENCV_AVAILABLE:
             self.report({'ERROR'}, "OpenCV is not available. Please install opencv-python package.")
             return {'CANCELLED'}
-        
+
+        # Initialize instance variables (fix threading bug)
+        self._timer = None
+        self._cap = None
+        self._frame_queue = Queue(maxsize=1)
+        self._tracking_thread = None
+        self._stop_thread = False
+        self._image = None
+        self._handle = None
+        self._texture = None
+        self._batch = None
+        self._shader = None
+
+        # Load Haar Cascade classifier once (performance fix)
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            self._face_cascade = cv2.CascadeClassifier(cascade_path)
+            if self._face_cascade.empty():
+                self.report({'ERROR'}, "Failed to load face detection cascade classifier")
+                return {'CANCELLED'}
+            logger.info("Haar Cascade loaded successfully")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load cascade classifier: {str(e)}")
+            return {'CANCELLED'}
+
         # Get selected camera index
         camera_idx = int(context.scene.facetracker.selected_camera)
-        print(f"Using camera index: {camera_idx}")
-        
+        logger.info(f"Using camera index: {camera_idx}")
+
         # Try to open the camera
         try:
-            print("Initializing camera...")
+            logger.info("Initializing camera...")
             if not self.init_camera(camera_idx):
                 if sys.platform == "darwin":
                     self.report({'ERROR'},
@@ -464,31 +530,31 @@ class FACETRACKER_OT_StartCamera(Operator):
                     self.report({'ERROR'}, "Failed to open camera. Please check if it's connected and not in use by another application.")
                 return {'CANCELLED'}
             
-            print("Camera initialized successfully")
+            logger.info("Camera initialized successfully")
             context.scene.facetracker.camera_active = True
-            
+
             # Add the viewport drawing callback
             args = (self, context)
             self._handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_px, args, 'WINDOW', 'POST_PIXEL')
-            print("Added viewport drawing callback")
-            
+            logger.info("Added viewport drawing callback")
+
             # Start capture thread
             self._stop_thread = False
             self._tracking_thread = Thread(target=self.capture_frames)
             self._tracking_thread.daemon = True
             self._tracking_thread.start()
-            print("Started capture thread")
-            
+            logger.info("Started capture thread")
+
             wm = context.window_manager
             self._timer = wm.event_timer_add(0.016, window=context.window)
             wm.modal_handler_add(self)
-            print("Added modal handler")
-            
+            logger.info("Camera started successfully - modal handler active")
+
             return {'RUNNING_MODAL'}
-            
+
         except Exception as e:
-            print(f"Camera initialization error: {str(e)}")
-            print(traceback.format_exc())
+            logger.error(f"Camera initialization error: {str(e)}")
+            logger.debug(traceback.format_exc())
             if self._cap:
                 self._cap.release()
             self.report({'ERROR'}, f"Camera error: {str(e)}")
@@ -498,9 +564,11 @@ class FACETRACKER_OT_StopCamera(Operator):
     """Stop camera capture"""
     bl_idname = "facetracker.stop_camera"
     bl_label = "Stop Camera"
-    
+
     def execute(self, context):
+        # Set camera_active to False, which will trigger cleanup in the modal operator
         context.scene.facetracker.camera_active = False
+        self.report({'INFO'}, "Camera stopping...")
         return {'FINISHED'}
 
 class FACETRACKER_PT_MainPanel(Panel):
